@@ -128,17 +128,27 @@ pub mod queries {
     }
 }
 
+use std::collections::HashMap;
+use std::fmt::Debug;
+use events::{Event, EventType};
+
 /// CQRS and Event Sourcing-based service implementation
 pub struct UrlShortenerService {
-    // TODO: add needed fields
+    events: HashMap<String, Vec<Event>>,
+    stats: HashMap<String, Stats>
 }
 
 impl UrlShortenerService {
     /// Creates a new instance of the service
     pub fn new() -> Self {
-        Self {}
+        Self {
+            events: HashMap::new(),
+            stats: HashMap::new()
+        }
     }
 }
+
+use domain::ShortLinkAggregate as ShortLinkAggregate;
 
 impl commands::CommandHandler for UrlShortenerService {
     fn handle_create_short_link(
@@ -146,19 +156,273 @@ impl commands::CommandHandler for UrlShortenerService {
         url: Url,
         slug: Option<Slug>,
     ) -> Result<ShortLink, ShortenerError> {
-        todo!("Implement the logic for creating a short link")
+        let mut aggregate = ShortLinkAggregate::new(self);
+
+        match slug {
+            Some(slug) => aggregate.rehydrate_by_slug(&slug),
+            None => aggregate.create_random_slug()
+        };
+
+        let short_link = aggregate.create_short_link(&url)?;
+
+        Ok(short_link)
     }
 
     fn handle_redirect(
         &mut self,
         slug: Slug,
     ) -> Result<ShortLink, ShortenerError> {
-        todo!("Implement the logic for redirection and incrementing the click counter")
+        let mut aggregate = ShortLinkAggregate::new(self);
+        aggregate.rehydrate_by_slug(&slug);
+        let short_link = aggregate.redirect()?;
+
+        Ok(short_link)
     }
 }
 
 impl queries::QueryHandler for UrlShortenerService {
     fn get_stats(&self, slug: Slug) -> Result<Stats, ShortenerError> {
-        todo!("Implement the logic for retrieving link statistics")
+        let stats_result = self.stats.get(&slug.0);
+        match stats_result {
+            Some(stats) => { Ok(stats.clone()) }
+            None => { Err(ShortenerError::SlugNotFound) }
+        }
     }
+}
+
+mod events {
+    use super::{Slug, Url};
+
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct Event {
+        pub slug: Slug,
+        pub event_type: EventType
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    pub enum EventType {
+        ShortLinkCreated(Url),
+        ShortLinkRedirected
+    }
+}
+
+impl domain::EventBroker for UrlShortenerService {
+    fn publish_event(&mut self, event: &Event) {
+        // Save event to event store
+        self.events.entry(event.slug.0.clone()).or_default().push(event.clone());
+
+        // Update Query Model
+        match &event.event_type {
+            EventType::ShortLinkCreated(url) => {
+                let stats = Stats {
+                    link: ShortLink { slug: event.slug.clone(), url: url.clone() },
+                    redirects: 0
+                };
+
+                self.stats.insert(event.slug.0.clone(), stats);
+            }
+            EventType::ShortLinkRedirected => {
+                if let Some(stats) = self.stats.get_mut(&event.slug.0) {
+                    stats.redirects += 1;
+                }
+            }
+        }
+    }
+
+    fn iter_by_slug(&self, slug: &Slug) -> Vec<Event> {
+        if let Some(events) = self.events.get(&slug.0) {
+            events.clone()
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+mod domain {
+    use std::time::SystemTime;
+    use super::events::{Event, EventType};
+    use super::{ShortLink, ShortenerError, Slug, Url};
+
+    pub trait EventBroker {
+        fn publish_event(&mut self, event: &Event);
+
+        fn iter_by_slug(&self, slug: &Slug) -> Vec<Event>;
+    }
+
+    pub struct ShortLinkAggregate<'a> {
+        broker: &'a mut dyn EventBroker,
+        state: ShortLink
+    }
+
+    impl<'a> ShortLinkAggregate<'a> {
+        pub fn new(eb: &'a mut dyn EventBroker) -> Self {
+            Self {
+                broker: eb,
+                state: ShortLink {
+                    slug: Slug("".to_string()),
+                    url: Url("".to_string())
+                }
+            }
+        }
+
+        pub fn rehydrate_by_slug(&mut self, slug: &Slug) {
+            self.state.slug = slug.clone();
+            for event in self.broker.iter_by_slug(slug) {
+                self.apply_event(&event);
+            }
+        }
+
+        pub fn create_random_slug(&mut self) {
+            self.state.slug = generate_random_slug();
+        }
+
+        pub fn apply_event(&mut self, event: &Event) {
+            self.broker.publish_event(&event);
+
+            match &event.event_type {
+                EventType::ShortLinkCreated(url) => {
+                    self.state.slug = event.slug.clone();
+                    self.state.url = url.clone();
+                }
+                _ => {}
+            }
+        }
+
+        pub fn create_short_link(&mut self, url: &Url) -> Result<ShortLink, ShortenerError> {
+            if !self.state.url.0.is_empty() {
+                return Err(ShortenerError::SlugAlreadyInUse);
+            }
+
+            if !is_valid_url(url) {
+                return Err(ShortenerError::InvalidUrl);
+            }
+
+            let event = Event {
+                slug: self.state.slug.clone(),
+                event_type: EventType::ShortLinkCreated(url.clone())
+            };
+
+            self.apply_event(&event);
+
+            Ok(self.state.clone())
+        }
+
+        pub fn redirect(&mut self) -> Result<ShortLink, ShortenerError> {
+            if self.state.url.0.is_empty(){
+                return Err(ShortenerError::SlugNotFound)
+            }
+
+            let event = Event {
+                slug: self.state.slug.clone(),
+                event_type: EventType::ShortLinkRedirected
+            };
+
+            self.apply_event(&event);
+
+            Ok(self.state.clone())
+        }
+    }
+
+    /// Use external crates to generate better slug
+    fn generate_random_slug() -> Slug {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            .to_string();
+
+        let mut str = "rand".to_string();
+        str.push_str(&now);
+
+        Slug(str)
+    }
+
+    /// This is simple implementation to avoid external dependencies.
+    /// In production use "url" package instead
+    fn is_valid_url(url: &Url) -> bool {
+        !url.0.is_empty() && url.0.contains('.') &&
+            (url.0.starts_with("http://") || url.0.starts_with("https://"))
+    }
+}
+
+impl From<&str> for Slug {
+    fn from(value: &str) -> Self {
+        Slug(value.to_string())
+    }
+}
+
+impl From<&str> for Url {
+    fn from(value: &str) -> Self {
+        Url(value.to_string())
+    }
+}
+
+trait Print {
+    fn print(&self);
+}
+
+impl<T: Debug> Print for T {
+    fn print(&self) {
+        println!("{:?}", self);
+    }
+}
+
+fn main() {
+    const SLUG_GOOGLE_VALID: &str = "goog";
+    const SLUG_MISSING: &str = "missing";
+    const URL_GOOGLE_VALID: &str = "https://google.com";
+    const URL_INVALID: &str = "invalid-url";
+
+    let mut service = UrlShortenerService::new();
+
+    let command_handler: &mut dyn commands::CommandHandler = &mut service;
+
+    println!("Create correct short link:");
+    let url = Url::from(URL_GOOGLE_VALID);
+    let slug = Slug::from(SLUG_GOOGLE_VALID);
+    command_handler.handle_create_short_link(url, Some(slug)).print();
+    println!();
+
+    println!("Try to create duplicate slug:");
+    let url = Url::from(URL_GOOGLE_VALID);
+    let slug = Slug::from(SLUG_GOOGLE_VALID);
+    command_handler.handle_create_short_link(url, Some(slug)).print();
+    println!();
+
+    println!("Try to create invalid URL:");
+    let url = Url::from(URL_INVALID);
+    command_handler.handle_create_short_link(url, None).print();
+    println!();
+
+    println!("Try to create with random slug:");
+    let url = Url::from(URL_GOOGLE_VALID);
+    command_handler.handle_create_short_link(url, None).print();
+    println!();
+
+    println!("Try to redirect for valid slug:");
+    let slug = Slug::from(SLUG_GOOGLE_VALID);
+    command_handler.handle_redirect(slug).print();
+    println!();
+
+    println!("Do the same again to increase counter to 2:");
+    let slug = Slug::from(SLUG_GOOGLE_VALID);
+    command_handler.handle_redirect(slug).print();
+    println!();
+
+    println!("Try to redirect missing slug:");
+    let slug = Slug::from(SLUG_MISSING);
+    command_handler.handle_redirect(slug).print();
+    println!();
+
+    let query_handler: &dyn queries::QueryHandler = &service;
+
+    println!("Query existing slug:");
+    let slug = Slug::from(SLUG_GOOGLE_VALID);
+    query_handler.get_stats(slug).print();
+    println!();
+
+    println!("Query missing slug:");
+    let slug = Slug::from(SLUG_MISSING);
+    query_handler.get_stats(slug).print();
+    println!();
 }
